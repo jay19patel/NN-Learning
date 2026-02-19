@@ -224,7 +224,8 @@ class RiskAwareLoss(nn.Module):
                  confidence_weight=1.0,
                  upside_weight=1.5,
                  downside_weight=1.5,
-                 risk_weight=1.0):
+                 risk_weight=1.0,
+                 class_weights=None):
         super().__init__()
         self.direction_weight = direction_weight
         self.confidence_weight = confidence_weight
@@ -232,7 +233,7 @@ class RiskAwareLoss(nn.Module):
         self.downside_weight = downside_weight
         self.risk_weight = risk_weight
         
-        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
         self.mse_loss = nn.MSELoss(reduction='none')
         
     def forward(self, predictions, targets):
@@ -333,10 +334,15 @@ class TradingDataset(Dataset):
 class TradingModelTrainer:
     """Complete training pipeline with validation and model saving"""
     
-    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu', model_dir='.', class_weights=None):
         self.model = model.to(device)
         self.device = device
-        self.criterion = RiskAwareLoss()
+        self.model_dir = model_dir
+        
+        if class_weights is not None:
+            class_weights = class_weights.to(device)
+            
+        self.criterion = RiskAwareLoss(class_weights=class_weights)
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=0.001,
@@ -352,6 +358,10 @@ class TradingModelTrainer:
         self.best_val_loss = float('inf')
         self.train_losses = []
         self.val_losses = []
+        
+        # Ensure model directory exists
+        import os
+        os.makedirs(self.model_dir, exist_ok=True)
         
     def train_epoch(self, train_loader):
         """Train for one epoch"""
@@ -403,6 +413,8 @@ class TradingModelTrainer:
         print("=" * 80)
         
         patience_counter = 0
+        import os
+        model_path = os.path.join(self.model_dir, 'best_trading_model.pth')
         
         for epoch in range(epochs):
             train_loss = self.train_epoch(train_loader)
@@ -417,7 +429,7 @@ class TradingModelTrainer:
             # Save best model
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                torch.save(self.model.state_dict(), 'best_trading_model.pth')
+                torch.save(self.model.state_dict(), model_path)
                 patience_counter = 0
                 best_marker = "⭐ NEW BEST"
             else:
@@ -439,7 +451,8 @@ class TradingModelTrainer:
         print(f"Best validation loss: {self.best_val_loss:.4f}")
         
         # Load best model
-        self.model.load_state_dict(torch.load('best_trading_model.pth'))
+        if os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path))
 
 
 # ============================================================================
@@ -464,7 +477,7 @@ class TradingSignalGenerator:
         self.scaler = scaler
         self.device = device
         
-    def generate_signal(self, features, current_price, account_size=10000, max_risk_per_trade=0.02):
+    def generate_signal(self, features, current_price, account_size=10000, max_risk_per_trade=0.02, threshold=0.6):
         """
         Generate trading signal for a single data point
         
@@ -473,6 +486,7 @@ class TradingSignalGenerator:
             current_price: Current market price
             account_size: Total account size
             max_risk_per_trade: Maximum risk per trade (e.g., 2% = 0.02)
+            threshold: Minimum confidence score to execute trade (0-1)
         
         Returns:
             dict with complete trading signal
@@ -494,10 +508,19 @@ class TradingSignalGenerator:
         # Extract predictions
         direction_probs = F.softmax(predictions['direction'], dim=1)[0]
         direction_class = direction_probs.argmax().item()  # 0=Buy, 1=Hold, 2=Sell
+        max_prob = direction_probs.max().item()
+        
+        # Confidence head output (0-1)
         confidence = predictions['confidence'][0].item()
+        
         upside = predictions['upside'][0].item()
         downside = predictions['downside'][0].item()
         risk_score = predictions['risk'][0].item()
+        
+        # ⭐ FILTER: If confidence or probability is too low, force HOLD
+        # effective_confidence = (confidence + max_prob) / 2  # Average of head and prob
+        if confidence < threshold or max_prob < threshold:
+             direction_class = 1  # Force HOLD
         
         # Map direction
         direction_map = {0: 'BUY', 1: 'HOLD', 2: 'SELL'}
@@ -607,25 +630,29 @@ def prepare_data_for_training(df):
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df_clean = df.dropna()
     
-    # Define target columns
-    target_cols = ['upside_pct', 'downside_pct', 'future_drawdown_pct']
+    # Define target columns (these are outputs, not inputs)
+    target_cols = ['upside_pct', 'downside_pct', 'future_drawdown_pct', 'direction_label']
     
-    # Feature columns (exclude OHLCV and targets)
-    exclude_cols = ['Open', 'High', 'Low', 'Close', 'Volume'] + target_cols
+    # Raw OHLCV columns (usually excluded to prevent leakage or scaling issues)
+    raw_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    
+    # Feature columns = All columns - (Raw Cols + Target Cols)
+    exclude_cols = raw_cols + target_cols
     feature_cols = [col for col in df_clean.columns if col not in exclude_cols]
     
-    print(f"✅ Features: {len(feature_cols)}")
+    print(f"✅ Total columns in dataset: {len(df_clean.columns)}")
+    print(f"❌ Excluded columns ({len(exclude_cols)}): {exclude_cols}")
+    print(f"✅ Input Features for Model: {len(feature_cols)}")
     print(f"✅ Samples: {len(df_clean)}")
     
-    # Create direction labels
-    # Buy(0) if upside > downside * 2
-    # Sell(2) if downside < upside * 2
-    # Hold(1) otherwise
-    df_clean['direction_label'] = 1  # Default Hold
-    buy_condition = df_clean['upside_pct'] > abs(df_clean['downside_pct']) * 2
-    sell_condition = abs(df_clean['downside_pct']) > df_clean['upside_pct'] * 2
-    df_clean.loc[buy_condition, 'direction_label'] = 0  # Buy
-    df_clean.loc[sell_condition, 'direction_label'] = 2  # Sell
+    # Ensure direction_label exists (it should come from data_prepare_organized.py now)
+    if 'direction_label' not in df_clean.columns:
+        print("⚠️ 'direction_label' not found in dataset. Recalculating...")
+        df_clean['direction_label'] = 1
+        buy_cond = df_clean['upside_pct'] > abs(df_clean['downside_pct']) * 2
+        sell_cond = abs(df_clean['downside_pct']) > df_clean['upside_pct'] * 2
+        df_clean.loc[buy_cond, 'direction_label'] = 0
+        df_clean.loc[sell_cond, 'direction_label'] = 2
     
     # Features and targets
     X = df_clean[feature_cols].values

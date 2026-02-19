@@ -8,6 +8,8 @@ import torch
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import joblib
 from trading_model import (
     MultiHeadTradingModel,
     TradingModelTrainer,
@@ -18,6 +20,8 @@ from data_prepare_organized import fetch_data, create_full_feature_set
 import warnings
 warnings.filterwarnings('ignore')
 
+# Configuration
+OUTPUT_DIR = 'model_outputs'
 
 # ============================================================================
 # STEP 1: LOAD OR GENERATE DATA
@@ -39,7 +43,7 @@ def load_and_prepare_data(csv_path=None, generate_new=True, days=500):
     print("STEP 1: DATA PREPARATION")
     print("="*80)
     
-    if csv_path and not generate_new:
+    if csv_path and not generate_new and os.path.exists(csv_path):
         print(f"📂 Loading data from {csv_path}...")
         df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
     else:
@@ -48,7 +52,7 @@ def load_and_prepare_data(csv_path=None, generate_new=True, days=500):
         df_ohlc = fetch_data(total_days=days)
         
         print("🔧 Creating feature set...")
-        df = create_full_feature_set(df_ohlc, lookahead=10)
+        df = create_full_feature_set(df_ohlc, lookahead=20)
     
     print(f"✅ Data shape: {df.shape}")
     print(f"✅ Features: {df.shape[1]}")
@@ -56,6 +60,12 @@ def load_and_prepare_data(csv_path=None, generate_new=True, days=500):
     
     return df
 
+
+# ============================================================================
+# STEP 2: TRAIN MODEL
+# ============================================================================
+
+from sklearn.utils.class_weight import compute_class_weight
 
 # ============================================================================
 # STEP 2: TRAIN MODEL
@@ -70,7 +80,7 @@ def train_trading_model(df, epochs=50):
         epochs: Number of training epochs
     
     Returns:
-        model, trainer, scaler, feature_cols
+        model, trainer, scaler, feature_cols, test_loader
     """
     print("\n" + "="*80)
     print("STEP 2: MODEL TRAINING")
@@ -78,6 +88,16 @@ def train_trading_model(df, epochs=50):
     
     # Prepare data
     train_loader, val_loader, test_loader, scaler, feature_cols = prepare_data_for_training(df)
+    
+    # Calculate class weights to handle imbalance
+    train_labels = train_loader.dataset.targets['direction']
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(train_labels),
+        y=train_labels
+    )
+    class_weights = torch.FloatTensor(class_weights)
+    print(f"⚖️ Class Weights: {class_weights}")
     
     # Initialize model
     input_dim = len(feature_cols)
@@ -91,8 +111,8 @@ def train_trading_model(df, epochs=50):
         dropout=0.2
     )
     
-    # Initialize trainer
-    trainer = TradingModelTrainer(model)
+    # Initialize trainer with output directory and class weights
+    trainer = TradingModelTrainer(model, model_dir=OUTPUT_DIR, class_weights=class_weights)
     
     # Train model
     trainer.fit(
@@ -109,138 +129,174 @@ def train_trading_model(df, epochs=50):
     test_loss = trainer.validate(test_loader)
     print(f"✅ Test Loss: {test_loss:.4f}")
     
-    return model, trainer, scaler, feature_cols
+    return model, trainer, scaler, feature_cols, test_loader
 
 
 # ============================================================================
-# STEP 3: GENERATE TRADING SIGNALS
+# STEP 3: SEQUENTIAL BACKTEST
 # ============================================================================
 
-def generate_signals_for_recent_data(df, model, scaler, feature_cols, num_recent=10):
+def run_sequential_backtest(df, model, scaler, feature_cols, initial_capital=10000):
     """
-    Generate trading signals for recent data points
-    
-    Args:
-        df: DataFrame with features
-        model: Trained model
-        scaler: Fitted scaler
-        feature_cols: List of feature column names
-        num_recent: Number of recent samples to generate signals for
-    
-    Returns:
-        List of trading signals
+    Run a realistic sequential backtest on the test set.
+    Rules:
+    - Iterate row by row through the test set.
+    - If no position is open: check for entry signals.
+    - If position is open: check for exit (TP/SL) against High/Low of current bar.
+    - Only one trade active at a time.
     """
     print("\n" + "="*80)
-    print("STEP 4: GENERATING TRADING SIGNALS")
+    print("STEP 4: SEQUENTIAL BACKTEST (REALISTIC)")
     print("="*80)
     
-    # Initialize signal generator
+    # Get test data (last 15% roughly, aligning with prepare_data_for_training split)
+    # Re-creating the split logic to get exact indices
+    # This assumes chronological split which prepare_data_for_training uses
+    train_size = int(len(df) * 0.7)
+    val_size = int(len(df) * 0.15)
+    test_start_idx = train_size + val_size
+    
+    test_df = df.iloc[test_start_idx:].copy()
+    print(f"📊 Backtesting on {len(test_df)} recent candles...")
+    print(f"🛡️ Confidence Threshold: 0.6")
+    
     signal_gen = TradingSignalGenerator(model, scaler)
     
-    # Get recent data
-    df_clean = df.dropna()
-    recent_data = df_clean.tail(num_recent)
-    
-    signals = []
-    
-    for idx, row in recent_data.iterrows():
-        # Get features
-        features = row[feature_cols].values
-        current_price = row['Close']
-        
-        # Generate signal
-        signal = signal_gen.generate_signal(
-            features=features,
-            current_price=current_price,
-            account_size=10000,  # $10,000 account
-            max_risk_per_trade=0.02  # 2% risk per trade
-        )
-        
-        signal['date'] = idx
-        signal['actual_close'] = current_price
-        
-        signals.append(signal)
-        
-        # Print signal
-        signal_gen.print_signal(signal)
-    
-    return signals
-
-
-# ============================================================================
-# STEP 4: BACKTEST & ANALYSIS
-# ============================================================================
-
-def simple_backtest(signals, initial_capital=10000):
-    """
-    Simple backtest to see how signals would have performed
-    
-    Args:
-        signals: List of trading signals
-        initial_capital: Starting capital
-    
-    Returns:
-        Backtest results
-    """
-    print("\n" + "="*80)
-    print("STEP 5: SIMPLE BACKTEST")
-    print("="*80)
-    
     capital = initial_capital
+    position = None # {direction, entry_price, size, sl, tp, entry_time}
     trades = []
     
-    for signal in signals:
-        if signal['direction'] == 'HOLD':
-            continue
+    for idx, row in test_df.iterrows():
+        current_price = row['Close']
+        current_high = row['High']
+        current_low = row['Low']
+        current_time = idx
         
-        # Simulate trade (simplified)
-        # In reality, you'd track actual price movements
-        if signal['direction'] == 'BUY':
-            # Assume we hit take profit 60% of time, stop loss 40%
-            hit_tp = np.random.random() < 0.6
-            if hit_tp:
-                profit = signal['max_profit']
-            else:
-                profit = -signal['max_loss']
-        else:  # SELL
-            hit_tp = np.random.random() < 0.6
-            if hit_tp:
-                profit = signal['max_profit']
-            else:
-                profit = -signal['max_loss']
-        
-        capital += profit
-        
-        trades.append({
-            'date': signal['date'],
-            'direction': signal['direction'],
-            'confidence': signal['confidence'],
-            'profit': profit,
-            'capital': capital
-        })
-    
-    # Results
+        # Check active position
+        if position:
+            exit_reason = None
+            exit_price = None
+            
+            # ⭐ TRAILING STOP LOGIC
+            if position['direction'] == 'BUY':
+                # Calculate current max profit potential
+                profit_pct = (current_high - position['entry_price']) / position['entry_price']
+                
+                # Move SL to Breakeven if > 0.6% profit
+                if profit_pct > 0.006:
+                    new_sl = position['entry_price'] * 1.001 # BE + small buffer
+                    if new_sl > position['sl']:
+                        position['sl'] = new_sl
+                
+                # Check SL (Hit Low?)
+                if current_low <= position['sl']:
+                    exit_price = position['sl'] 
+                    exit_reason = 'STOP_LOSS'
+                # Check TP (Hit High?)
+                elif current_high >= position['tp']:
+                    exit_price = position['tp']
+                    exit_reason = 'TAKE_PROFIT'
+                
+                if exit_price:
+                    pnl = (exit_price - position['entry_price']) * position['size']
+                    capital += pnl
+                    trades.append({
+                        'entry_time': position['entry_time'],
+                        'exit_time': current_time,
+                        'direction': 'BUY',
+                        'entry_price': position['entry_price'],
+                        'exit_price': exit_price,
+                        'pnl': pnl,
+                        'capital': capital,
+                        'reason': exit_reason
+                    })
+                    position = None
+                    continue
+            
+            elif position['direction'] == 'SELL':
+                # Calculate current max profit potential (price goes down)
+                profit_pct = (position['entry_price'] - current_low) / position['entry_price']
+                
+                # Move SL to Breakeven if > 0.6% profit
+                if profit_pct > 0.006:
+                    new_sl = position['entry_price'] * 0.999 # BE + small buffer
+                    if new_sl < position['sl']:
+                        position['sl'] = new_sl
+                
+                # Check SL (Hit High?)
+                if current_high >= position['sl']:
+                    exit_price = position['sl']
+                    exit_reason = 'STOP_LOSS'
+                # Check TP (Hit Low?)
+                elif current_low <= position['tp']:
+                    exit_price = position['tp']
+                    exit_reason = 'TAKE_PROFIT'
+                
+                if exit_price:
+                    pnl = (position['entry_price'] - exit_price) * position['size']
+                    capital += pnl
+                    trades.append({
+                        'entry_time': position['entry_time'],
+                        'exit_time': current_time,
+                        'direction': 'SELL',
+                        'entry_price': position['entry_price'],
+                        'exit_price': exit_price,
+                        'pnl': pnl,
+                        'capital': capital,
+                        'reason': exit_reason
+                    })
+                    position = None
+                    continue
+
+        # No active position (or just closed), check for entry
+        if position is None:
+            features = row[feature_cols].values
+            signal = signal_gen.generate_signal(
+                features=features,
+                current_price=current_price,
+                account_size=capital,
+                max_risk_per_trade=0.02,
+                threshold=0.6
+            )
+            
+            if signal['direction'] != 'HOLD':
+                # Open Position
+                position = {
+                    'direction': signal['direction'],
+                    'entry_price': current_price,
+                    'size': signal['position_size'],
+                    'sl': signal['stop_loss'],
+                    'tp': signal['take_profit'],
+                    'entry_time': current_time
+                }
+                # print(f"OPEN {signal['direction']} at {current_time} @ {current_price}")
+
+    # Analyze results
     if len(trades) > 0:
+        trades_df = pd.DataFrame(trades)
         total_trades = len(trades)
-        profitable_trades = sum(1 for t in trades if t['profit'] > 0)
-        win_rate = profitable_trades / total_trades * 100
-        total_profit = capital - initial_capital
-        roi = (capital - initial_capital) / initial_capital * 100
+        profitable = trades_df[trades_df['pnl'] > 0]
+        win_rate = len(profitable) / total_trades * 100
+        total_pnl = capital - initial_capital
+        roi = (total_pnl / initial_capital) * 100
         
         print(f"📊 Total Trades: {total_trades}")
-        print(f"✅ Profitable Trades: {profitable_trades}")
-        print(f"📈 Win Rate: {win_rate:.1f}%")
-        print(f"💰 Total Profit: ${total_profit:.2f}")
-        print(f"📊 ROI: {roi:.2f}%")
+        print(f"✅ Win Rate: {win_rate:.2f}%")
+        print(f"💰 Total PnL: ${total_pnl:.2f}")
+        print(f"📈 ROI: {roi:.2f}%")
         print(f"💵 Final Capital: ${capital:.2f}")
+        
+        # Save trades
+        trades_file = os.path.join(OUTPUT_DIR, 'backtest_trades.csv')
+        trades_df.to_csv(trades_file)
+        print(f"✅ Trade history saved to: {trades_file}")
     else:
-        print("⚠️  No trades executed (all signals were HOLD)")
-    
+        print("⚠️ No trades executed in the test period.")
+        
     return trades
 
-
 # ============================================================================
-# STEP 5: PLOT TRAINING HISTORY
+# STEP 4: PLOT TRAINING HISTORY
 # ============================================================================
 
 def plot_training_history(trainer):
@@ -269,9 +325,9 @@ def plot_training_history(trainer):
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.tight_layout()
-    plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
-    print("✅ Saved: training_history.png")
+    output_path = os.path.join(OUTPUT_DIR, 'training_history.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"✅ Saved: {output_path}")
 
 
 # ============================================================================
@@ -281,59 +337,51 @@ def plot_training_history(trainer):
 def main():
     """Complete end-to-end pipeline"""
     
+    # Ensure output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
     print("\n" + "⭐"*40)
-    print("⭐⭐⭐ PROFESSIONAL TRADING MODEL TRAINING PIPELINE ⭐⭐⭐")
+    print("⭐⭐⭐ PROFESSIONAL TRADING MODEL PIPELINE ⭐⭐⭐")
     print("⭐"*40 + "\n")
     
     # Step 1: Load/Generate Data
-    # Use the pre-calculated features file
-    csv_file = 'features_output.csv'
+    # For training, we need features. 
+    # data_prepare_organized.py handles fetching/calculation but doesn't auto-save
+    # features_output.csv anymore.
+    # So we call load_and_prepare_data which calls fetch_data + create_full_feature_set
     
     df = load_and_prepare_data(
-        csv_path=csv_file,  # Point to our features file
-        generate_new=False, # Don't generate new data
+        csv_path=os.path.join(OUTPUT_DIR, 'features_output.csv'), # Try to load from here if exists?
+        generate_new=True, # Always regenerate for now to ensure freshness or fetch from API cache
         days=500
     )
     
     # Step 2: Train Model
-    model, trainer, scaler, feature_cols = train_trading_model(
+    model, trainer, scaler, feature_cols, test_loader = train_trading_model(
         df=df,
-        epochs=50  # Increase for better results
+        epochs=50 
     )
+    
+    # Save scaler and feature columns for inference
+    joblib.dump(scaler, os.path.join(OUTPUT_DIR, 'scaler.sav'))
+    joblib.dump(feature_cols, os.path.join(OUTPUT_DIR, 'feature_cols.sav'))
+    print(f"✅ Saved scaler and feature columns to {OUTPUT_DIR}")
     
     # Step 3: Plot Training History
     plot_training_history(trainer)
     
-    # Step 4: Generate Signals
-    signals = generate_signals_for_recent_data(
+    # Step 4: Sequential Backtest
+    run_sequential_backtest(
         df=df,
         model=model,
         scaler=scaler,
         feature_cols=feature_cols,
-        num_recent=10
+        initial_capital=10000
     )
-    
-    # Step 5: Simple Backtest
-    trades = simple_backtest(signals, initial_capital=10000)
-    
-    # Save signals to CSV
-    if len(signals) > 0:
-        signals_df = pd.DataFrame(signals)
-        signals_df.to_csv('trading_signals.csv', index=False)
-        print(f"\n✅ Signals saved to: trading_signals.csv")
     
     print("\n" + "="*80)
     print("🎉 PIPELINE COMPLETE!")
-    print("="*80)
-    print("\n📁 Generated Files:")
-    print("  1. best_trading_model.pth - Trained model weights")
-    print("  2. training_history.png - Training visualization")
-    print("  3. trading_signals.csv - Generated trading signals")
-    print("\n💡 Next Steps:")
-    print("  1. Test on real historical data")
-    print("  2. Implement live trading integration")
-    print("  3. Add more sophisticated backtesting")
-    print("  4. Fine-tune hyperparameters")
+    print(f"All outputs saved in: {OUTPUT_DIR}/")
     print("="*80)
 
 
@@ -341,46 +389,22 @@ def main():
 # INFERENCE MODE (For live trading)
 # ============================================================================
 
-def live_trading_mode(df_latest, model_path='/home/claude/best_trading_model.pth'):
+def live_trading_mode(df_latest, model_path=None):
     """
     Use trained model for live trading
-    
-    Args:
-        df_latest: DataFrame with latest features (single row or recent rows)
-        model_path: Path to trained model weights
-    
-    Returns:
-        Trading signal
     """
+    if model_path is None:
+        model_path = os.path.join(OUTPUT_DIR, 'best_trading_model.pth')
+        
     print("\n" + "="*80)
     print("🔴 LIVE TRADING MODE")
     print("="*80)
     
-    # This assumes you have already:
-    # 1. Trained the model
-    # 2. Saved the scaler
-    # 3. Have live market data with features
+    # Load model, scaler, feature_cols
+    # ... implementation details ...
     
-    # Load model
-    # feature_cols = [...] # Load from saved file
-    # scaler = joblib.load('scaler.pkl')
-    # model = MultiHeadTradingModel(input_dim=len(feature_cols))
-    # model.load_state_dict(torch.load(model_path))
-    
-    # Generate signal
-    # signal_gen = TradingSignalGenerator(model, scaler)
-    # signal = signal_gen.generate_signal(
-    #     features=df_latest[feature_cols].iloc[-1],
-    #     current_price=df_latest['Close'].iloc[-1]
-    # )
-    
-    print("⚠️  Implement this for live trading")
-    print("See code comments for details")
+    print("⚠️  Implement detailed live trading logic using loaded artifacts")
 
 
 if __name__ == "__main__":
-    # Run complete training pipeline
     main()
-    
-    # For live trading, use:
-    # live_trading_mode(your_latest_data)

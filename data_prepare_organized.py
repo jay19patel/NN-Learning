@@ -562,6 +562,55 @@ def add_interaction_features(df):
 # MAIN PIPELINE
 # ============================================================================
 
+# ============================================================================
+# ⭐ TARGET LABELS
+# ============================================================================
+
+def add_target_labels(df):
+    """
+    Add classification labels based on risk/reward and minimum return.
+    
+    Labels:
+    - 0: BUY (High reward/risk ratio + sufficient upside)
+    - 1: HOLD (Low conviction or chop)
+    - 2: SELL (High reward/risk ratio + sufficient downside)
+    """
+    
+    # Default to HOLD
+    df['direction_label'] = 1
+    
+    # Parameters
+    min_return = 0.8  # Minimum 0.8% move required (filters out noise)
+    risk_reward_ratio = 1.0  # Reward must be 1.0x risk (Balanced)
+    
+    # Ensure upside/downside exist
+    if 'upside_pct' in df.columns and 'downside_pct' in df.columns:
+        # BUY Condition:
+        # 1. Upside > Downside * Ratio
+        # 2. Upside >= Minimum Return
+        buy_condition = (
+            (df['upside_pct'] > abs(df['downside_pct']) * risk_reward_ratio) & 
+            (df['upside_pct'] >= min_return)
+        )
+        
+        # SELL Condition:
+        # 1. Downside > Upside * Ratio (absolute values)
+        # 2. Downside >= Minimum Return (absolute value)
+        sell_condition = (
+            (abs(df['downside_pct']) > df['upside_pct'] * risk_reward_ratio) & 
+            (abs(df['downside_pct']) >= min_return)
+        )
+        
+        df.loc[buy_condition, 'direction_label'] = 0  # Buy
+        df.loc[sell_condition, 'direction_label'] = 2  # Sell
+        
+    return df
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
 def create_full_feature_set(df, lookahead=10):
     """
     Complete feature engineering pipeline
@@ -614,6 +663,9 @@ def create_full_feature_set(df, lookahead=10):
     
     print("Adding interaction features...")
     df = add_interaction_features(df)
+    
+    print("Adding target labels...")
+    df = add_target_labels(df)
     
     # Fill any remaining NaN values
     df = df.bfill().ffill()
@@ -676,6 +728,7 @@ if __name__ == "__main__":
                 print(f"  ... and {len(matching_cols) - 10} more")
     
     # Save to CSV
-    output_file = 'features_output.csv'
-    df_with_features.to_csv(output_file)
-    print(f"\n✅ Features saved to: {output_file}")
+    # output_file = 'features_output.csv'
+    # df_with_features.to_csv(output_file)
+    # print(f"\n✅ Features saved to: {output_file}")
+    print("\n✅ Features generation complete (not saved to CSV)")
