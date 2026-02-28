@@ -151,12 +151,12 @@ def run_sequential_backtest(df, model, scaler, feature_cols, initial_capital=100
     
     # Get test data (last 15% roughly, aligning with prepare_data_for_training split)
     # Re-creating the split logic to get exact indices
-    # This assumes chronological split which prepare_data_for_training uses
-    train_size = int(len(df) * 0.7)
-    val_size = int(len(df) * 0.15)
+    df_clean = df.replace([np.inf, -np.inf], np.nan).dropna()
+    train_size = int(len(df_clean) * 0.7)
+    val_size = int(len(df_clean) * 0.15)
     test_start_idx = train_size + val_size
     
-    test_df = df.iloc[test_start_idx:].copy()
+    test_df = df_clean.iloc[test_start_idx:].copy()
     print(f"📊 Backtesting on {len(test_df)} recent candles...")
     print(f"🛡️ Confidence Threshold: 0.6")
     
@@ -182,9 +182,15 @@ def run_sequential_backtest(df, model, scaler, feature_cols, initial_capital=100
                 # Calculate current max profit potential
                 profit_pct = (current_high - position['entry_price']) / position['entry_price']
                 
-                # Move SL to Breakeven if > 0.6% profit
-                if profit_pct > 0.006:
-                    new_sl = position['entry_price'] * 1.001 # BE + small buffer
+                # Move SL to Breakeven if > 0.2% profit
+                if profit_pct > 0.002:
+                    new_sl = position['entry_price'] * 1.0005 # BE + small buffer
+                    if new_sl > position['sl']:
+                        position['sl'] = new_sl
+                        
+                # Trailing step if > 0.4% profit: lock 0.25%
+                if profit_pct > 0.004:
+                    new_sl = position['entry_price'] * 1.0025
                     if new_sl > position['sl']:
                         position['sl'] = new_sl
                 
@@ -217,9 +223,15 @@ def run_sequential_backtest(df, model, scaler, feature_cols, initial_capital=100
                 # Calculate current max profit potential (price goes down)
                 profit_pct = (position['entry_price'] - current_low) / position['entry_price']
                 
-                # Move SL to Breakeven if > 0.6% profit
-                if profit_pct > 0.006:
-                    new_sl = position['entry_price'] * 0.999 # BE + small buffer
+                # Move SL to Breakeven if > 0.2% profit
+                if profit_pct > 0.002:
+                    new_sl = position['entry_price'] * 0.9995 # BE + small buffer
+                    if new_sl < position['sl']:
+                        position['sl'] = new_sl
+                        
+                # Trailing step if > 0.4% profit: lock 0.25%
+                if profit_pct > 0.004:
+                    new_sl = position['entry_price'] * 0.9975
                     if new_sl < position['sl']:
                         position['sl'] = new_sl
                 
@@ -290,6 +302,59 @@ def run_sequential_backtest(df, model, scaler, feature_cols, initial_capital=100
         trades_file = os.path.join(OUTPUT_DIR, 'backtest_trades.csv')
         trades_df.to_csv(trades_file)
         print(f"✅ Trade history saved to: {trades_file}")
+        
+        # Plot historical trades with entries, exits, and PnL
+        import matplotlib.dates as mdates
+        
+        print("\n📊 Plotting historical trades...")
+        plt.figure(figsize=(16, 12))
+        
+        # Price and Trade Markers
+        ax1 = plt.subplot(2, 1, 1)
+        ax1.plot(test_df.index, test_df['Close'], label='Price', color='black', alpha=0.5, linewidth=1)
+        
+        for t in trades:
+            color = 'green' if t['pnl'] > 0 else 'red'
+            marker = '^' if t['direction'] == 'BUY' else 'v'
+            
+            # Entry point
+            ax1.scatter(t['entry_time'], t['entry_price'], color='blue', marker=marker, s=100, zorder=5)
+            # Exit point
+            ax1.scatter(t['exit_time'], t['exit_price'], color=color, marker='X' if t['pnl'] > 0 else 'x', s=100, zorder=5)
+            # Connect them
+            ax1.plot([t['entry_time'], t['exit_time']], [t['entry_price'], t['exit_price']], color=color, linestyle='--', alpha=0.7)
+            
+            # Label
+            ax1.text(t['exit_time'], t['exit_price'], f" ${t['pnl']:.2f}", color=color, fontsize=10, fontweight='bold')
+            
+        ax1.set_title('Historical Trades: Entries, Exits, and PnL', fontsize=14)
+        ax1.set_ylabel('Price', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        
+        # Custom legend elements
+        from matplotlib.lines import Line2D
+        custom_lines = [
+            Line2D([0], [0], color='blue', marker='^', linestyle='None', markersize=10, label='BUY Entry'),
+            Line2D([0], [0], color='blue', marker='v', linestyle='None', markersize=10, label='SELL Entry'),
+            Line2D([0], [0], color='green', marker='X', linestyle='None', markersize=10, label='Exit (Profit)'),
+            Line2D([0], [0], color='red', marker='x', linestyle='None', markersize=10, label='Exit (Loss)')
+        ]
+        ax1.legend(handles=custom_lines, loc='upper left')
+        
+        # Cumulative PnL
+        ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+        trades_df['cumulative_pnl'] = trades_df['pnl'].cumsum()
+        ax2.plot(trades_df['exit_time'], trades_df['cumulative_pnl'], color='green', drawstyle='steps-post', linewidth=2)
+        ax2.axhline(0, color='black', linestyle='--', alpha=0.5)
+        ax2.set_title('Cumulative PnL Over Time', fontsize=14)
+        ax2.set_ylabel('Cumulative PnL ($)', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plot_path = os.path.join(OUTPUT_DIR, 'historical_trades.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Saved historical trades plot to: {plot_path}")
     else:
         print("⚠️ No trades executed in the test period.")
         
@@ -362,13 +427,13 @@ def main():
         epochs=50 
     )
     
-    # Save scaler and feature columns for inference
-    joblib.dump(scaler, os.path.join(OUTPUT_DIR, 'scaler.sav'))
-    joblib.dump(feature_cols, os.path.join(OUTPUT_DIR, 'feature_cols.sav'))
-    print(f"✅ Saved scaler and feature columns to {OUTPUT_DIR}")
+    # Save scaler and feature columns for inference (Disabled per user request)
+    # joblib.dump(scaler, os.path.join(OUTPUT_DIR, 'scaler.sav'))
+    # joblib.dump(feature_cols, os.path.join(OUTPUT_DIR, 'feature_cols.sav'))
+    # print(f"✅ Saved scaler and feature columns to {OUTPUT_DIR}")
     
-    # Step 3: Plot Training History
-    plot_training_history(trainer)
+    # Step 3: Plot Training History (Disabled per user request)
+    # plot_training_history(trainer)
     
     # Step 4: Sequential Backtest
     run_sequential_backtest(

@@ -415,6 +415,8 @@ class TradingModelTrainer:
         patience_counter = 0
         import os
         model_path = os.path.join(self.model_dir, 'best_trading_model.pth')
+        import copy
+        best_model_state = None
         
         for epoch in range(epochs):
             train_loss = self.train_epoch(train_loader)
@@ -429,7 +431,8 @@ class TradingModelTrainer:
             # Save best model
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                torch.save(self.model.state_dict(), model_path)
+                # torch.save(self.model.state_dict(), model_path)
+                best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
                 best_marker = "⭐ NEW BEST"
             else:
@@ -451,8 +454,10 @@ class TradingModelTrainer:
         print(f"Best validation loss: {self.best_val_loss:.4f}")
         
         # Load best model
-        if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path))
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+        # if os.path.exists(model_path):
+        #     self.model.load_state_dict(torch.load(model_path))
 
 
 # ============================================================================
@@ -527,12 +532,20 @@ class TradingSignalGenerator:
         direction = direction_map[direction_class]
         
         # Calculate Stop Loss and Take Profit
+        downside_val = abs(downside) / 100.0
+        upside_val = abs(upside) / 100.0
+        
+        # Restrict SL between 0.15% and 0.4% to minimize losses
+        sl_pct = max(min(downside_val, 0.004), 0.0015)
+        # Ensure TP is at least 0.6% (achievable on 15m TF) while keeping R:R > 1.5
+        tp_pct = max(upside_val, 0.006)
+        
         if direction == 'BUY':
-            stop_loss = current_price * (1 + downside / 100)  # Downside is negative
-            take_profit = current_price * (1 + upside / 100)
+            stop_loss = current_price * (1 - sl_pct)
+            take_profit = current_price * (1 + tp_pct)
         elif direction == 'SELL':
-            stop_loss = current_price * (1 - downside / 100)
-            take_profit = current_price * (1 - upside / 100)
+            stop_loss = current_price * (1 + sl_pct)
+            take_profit = current_price * (1 - tp_pct)
         else:  # HOLD
             stop_loss = current_price
             take_profit = current_price
